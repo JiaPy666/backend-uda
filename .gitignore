@@ -1,0 +1,14 @@
+# Ambiente virtuale (anche se uv ne ha già uno interno)
+.venv/
+
+# Cache di Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Variabili d'ambiente (per non caricare password in futuro)
+.env
+
+# Cartelle degli IDE
+.vscode/
+.idea/

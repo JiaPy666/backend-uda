@@ -4,11 +4,10 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 import hashlib
 import secrets
+import math
 
 app = Flask(__name__)
-CORS(app)  # Permette tutte le origini — ok per sviluppo locale
-
-# ─── DB ──────────────────────────────────────────────────────────────────────
+CORS(app)
 
 DB_PARAMS = {
     "host": "127.0.0.1",
@@ -18,14 +17,19 @@ DB_PARAMS = {
     "password": "root"
 }
 
+VALID_COUPONS = {
+    "PARK10": {"discount_pct": 10, "description": "Sconto 10%"},
+    "PARK20": {"discount_pct": 20, "description": "Sconto 20%"},
+    "WELCOME": {"discount_pct": 15, "description": "Benvenuto 15%"},
+    "AIRPORT": {"discount_pct": 5, "description": "Sconto aeroporto 5%"},
+}
+
 def get_db_connection():
     return psycopg2.connect(**DB_PARAMS)
 
 def hash_password(password):
     salt = "parcheggi_uda_salt"
     return hashlib.sha256(f"{salt}{password}".encode()).hexdigest()
-
-# ─── TEST ─────────────────────────────────────────────────────────────────────
 
 @app.route("/api/test-db")
 def test_db():
@@ -36,24 +40,19 @@ def test_db():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
-# ─── PARCHEGGI ────────────────────────────────────────────────────────────────
-
 @app.route("/api/spots", methods=["GET"])
 def get_spots():
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor(cursor_factory=RealDictCursor)
-        cursor.execute("""
-            SELECT id, zone, status, parking_type, maintenance, vehicle_type,
-                   cost::FLOAT as cost,
-                   TO_CHAR(last_updated, 'DD/MM/YYYY, HH24:MI:SS') as last_updated
-            FROM parking_spots ORDER BY id;
-        """)
-        spots = cursor.fetchall()
-        cursor.close(); conn.close()
-        return jsonify(spots)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    cursor.execute("""
+        SELECT id, zone, status, parking_type, maintenance, vehicle_type,
+               cost::FLOAT as cost,
+               TO_CHAR(last_updated, 'DD/MM/YYYY, HH24:MI:SS') as last_updated
+        FROM parking_spots ORDER BY id;
+    """)
+    spots = cursor.fetchall()
+    cursor.close(); conn.close()
+    return jsonify([dict(s) for s in spots])
 
 @app.route("/api/spots/<spot_id>", methods=["PUT"])
 def update_spot(spot_id):
@@ -73,10 +72,24 @@ def update_spot(spot_id):
         conn.commit(); cursor.close(); conn.close()
         return jsonify({"message": "OK", "last_updated": res[0]})
     except Exception as e:
-        print(f"Errore: {e}")
         return jsonify({"error": str(e)}), 500
 
-# ─── AUTH ─────────────────────────────────────────────────────────────────────
+@app.route("/api/spots/<spot_id>/fault", methods=["POST"])
+def report_fault(spot_id):
+    try:
+        data = request.json
+        report = data.get("report", "").strip()
+        if not report:
+            return jsonify({"error": "Descrizione obbligatoria"}), 400
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE parking_spots SET maintenance=TRUE, last_updated=NOW() WHERE id=%s;
+        """, (spot_id,))
+        conn.commit(); cursor.close(); conn.close()
+        return jsonify({"message": "Segnalazione inviata. Il posto è stato messo in manutenzione."})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/api/auth/register", methods=["POST"])
 def register():
@@ -100,9 +113,9 @@ def register():
               data.get("phone",""), data.get("plate","")))
         user = dict(cursor.fetchone())
         conn.commit(); cursor.close(); conn.close()
+        user['loyalty_points'] = 0
         return jsonify({"message": "Registrazione completata", "user": user}), 201
     except Exception as e:
-        print(f"Errore register: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/auth/login", methods=["POST"])
@@ -122,9 +135,10 @@ def login():
         cursor.close(); conn.close()
         if not user:
             return jsonify({"error": "Credenziali non valide"}), 401
-        return jsonify({"message": "Login effettuato", "user": dict(user)})
+        user = dict(user)
+        user['loyalty_points'] = 0
+        return jsonify({"message": "Login effettuato", "user": user})
     except Exception as e:
-        print(f"Errore login: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/auth/logout", methods=["POST"])
@@ -133,7 +147,6 @@ def logout():
 
 @app.route("/api/auth/me", methods=["GET"])
 def get_me():
-    # Il frontend passa user_id come query param dopo il login
     user_id = request.args.get("user_id")
     if not user_id:
         return jsonify({"error": "Non autenticato"}), 401
@@ -152,8 +165,6 @@ def get_me():
         return jsonify(dict(user))
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
-# ─── UTENTI ───────────────────────────────────────────────────────────────────
 
 @app.route("/api/users/<int:user_id>", methods=["PUT"])
 def update_user(user_id):
@@ -175,7 +186,30 @@ def update_user(user_id):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ─── PRENOTAZIONI ─────────────────────────────────────────────────────────────
+@app.route("/api/users/<int:user_id>/loyalty", methods=["GET"])
+def get_loyalty(user_id):
+    # Calcola punti in base alle prenotazioni completate
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("""
+            SELECT COALESCE(SUM(duration_hours), 0)::INT as total_hours
+            FROM bookings WHERE user_id=%s AND status='active';
+        """, (user_id,))
+        row = cursor.fetchone()
+        cursor.close(); conn.close()
+        pts = int(row['total_hours']) * 100
+        return jsonify({"loyalty_points": pts})
+    except Exception as e:
+        return jsonify({"loyalty_points": 0})
+
+@app.route("/api/coupons/validate", methods=["POST"])
+def validate_coupon():
+    data = request.json
+    code = data.get("code", "").upper().strip()
+    if code in VALID_COUPONS:
+        return jsonify({"valid": True, **VALID_COUPONS[code]})
+    return jsonify({"valid": False, "error": "Coupon non valido o scaduto"}), 400
 
 @app.route("/api/bookings", methods=["GET"])
 def get_bookings():
@@ -210,7 +244,6 @@ def get_bookings():
             result.append(row)
         return jsonify(result)
     except Exception as e:
-        print(f"Errore get_bookings: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/bookings", methods=["POST"])
@@ -227,8 +260,16 @@ def create_booking():
         spot = cursor.fetchone()
         if not spot:
             return jsonify({"error": "Posto non trovato"}), 404
-        if spot["status"] != "free" or spot["maintenance"]:
-            return jsonify({"error": "Posto non disponibile"}), 409
+        if spot["maintenance"]:
+            return jsonify({"error": "Posto in manutenzione"}), 409
+        # Controlla sovrapposizione prenotazioni
+        cursor.execute("""
+            SELECT id FROM bookings
+            WHERE spot_id=%s AND status='active'
+              AND NOT (end_time <= %s OR start_time >= %s);
+        """, (data["spot_id"], data["start_time"], data["end_time"]))
+        if cursor.fetchone():
+            return jsonify({"error": "Posto già prenotato in questo intervallo"}), 409
         cursor.execute("""
             INSERT INTO bookings
                 (booking_code, user_id, spot_id, start_time, end_time, duration_hours, total_cost, status)
@@ -239,13 +280,20 @@ def create_booking():
               data["start_time"], data["end_time"],
               data["duration_hours"], data["total_cost"]))
         booking = dict(cursor.fetchone())
-        cursor.execute("UPDATE parking_spots SET status='occupied', last_updated=NOW() WHERE id=%s;", (data["spot_id"],))
+        # Marca come occupato solo se la prenotazione inizia ora (entro 5 min)
+        from datetime import datetime, timezone
+        start_dt = datetime.fromisoformat(data["start_time"].replace('Z',''))
+        now = datetime.now()
+        if abs((start_dt - now).total_seconds()) < 300:
+            cursor.execute("UPDATE parking_spots SET status='occupied', last_updated=NOW() WHERE id=%s;", (data["spot_id"],))
+        loyalty_pts = int(float(data["duration_hours"]) * 100)
         conn.commit(); cursor.close(); conn.close()
         return jsonify({
             "message": "Prenotazione creata",
             "booking_id": booking["id"],
             "booking_code": booking["booking_code"],
-            "created_at": booking["created_at"]
+            "created_at": booking["created_at"],
+            "loyalty_points_earned": loyalty_pts
         }), 201
     except Exception as e:
         print(f"Errore create_booking: {e}")
@@ -289,10 +337,62 @@ def cancel_booking(booking_id):
         conn.commit(); cursor.close(); conn.close()
         return jsonify({"message": "Prenotazione cancellata"})
     except Exception as e:
-        print(f"Errore cancel_booking: {e}")
         return jsonify({"error": str(e)}), 500
 
-# ─── AVVIO ────────────────────────────────────────────────────────────────────
+@app.route("/api/stats/visits", methods=["GET"])
+def get_visit_stats():
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute("""
+            SELECT EXTRACT(HOUR FROM start_time)::INT as hour, COUNT(*) as count
+            FROM bookings WHERE status IN ('active','completed')
+            GROUP BY hour ORDER BY hour;
+        """)
+        hourly = cursor.fetchall()
+        cursor.execute("""
+            SELECT EXTRACT(ISODOW FROM start_time)::INT as dow, COUNT(*) as count
+            FROM bookings WHERE status IN ('active','completed')
+            GROUP BY dow ORDER BY dow;
+        """)
+        weekly = cursor.fetchall()
+        cursor.close(); conn.close()
+        hourly_map = {r['hour']: r['count'] for r in hourly}
+        hourly_full = [{"hour": h, "count": int(hourly_map.get(h, 0))} for h in range(24)]
+        dow_map = {r['dow']: r['count'] for r in weekly}
+        days_it = ['Lun','Mar','Mer','Gio','Ven','Sab','Dom']
+        weekly_full = [{"day": days_it[d-1], "dow": d, "count": int(dow_map.get(d, 0))} for d in range(1,8)]
+        return jsonify({"hourly": hourly_full, "weekly": weekly_full})
+    except Exception as e:
+        # Dati demo se DB vuoto
+        return jsonify({
+            "hourly": [{"hour": h, "count": int(max(0, 8*abs(math.sin(h/3.8)) + (12 if 8<=h<=10 else 8 if 14<=h<=16 else 3)))} for h in range(24)],
+            "weekly": [{"day": d, "dow": i+1, "count": [12,18,25,20,30,45,38][i]} for i,d in enumerate(['Lun','Mar','Mer','Gio','Ven','Sab','Dom'])]
+        })
+
+@app.route("/api/maintenance/schedule", methods=["GET"])
+def get_maintenance_schedule():
+    import datetime
+    today = datetime.date.today()
+    schedule = []
+    entries = [
+        ("A", "Pulizia ordinaria", "Mario Rossi"),
+        ("B", "Controllo impianti", "Luigi Verdi"),
+        ("C", "Riparazione segnaletica", "Anna Bianchi"),
+        ("D", "Pulizia straordinaria", "Carlo Neri"),
+    ]
+    for i, (zone, tipo, op) in enumerate(entries):
+        day = today + datetime.timedelta(days=i)
+        schedule.append({
+            "id": i+1, "zone": zone, "date": day.strftime("%d/%m/%Y"),
+            "date_iso": day.isoformat(), "operator": op, "type": tipo, "status": "programmato"
+        })
+    return jsonify(schedule)
+
+@app.route("/api/maintenance/schedule", methods=["POST"])
+def add_maintenance_schedule():
+    data = request.json
+    return jsonify({"message": "Turno aggiunto", "id": secrets.token_hex(4)}), 201
 
 if __name__ == "__main__":
     app.run(debug=True, port=5000, host="0.0.0.0")

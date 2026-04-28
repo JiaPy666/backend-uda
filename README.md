@@ -1,6 +1,6 @@
 ## Come si avvia il progetto backend 
 ```
-git clone https://github.com/JiaPy666/backend-uda.git
+cd backend-uda
 ```
 ```
 uv sync

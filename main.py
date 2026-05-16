@@ -100,15 +100,6 @@ def run_migrations():
 
 run_migrations()
 
-# ── TEST ───────────────────────────────────────────────────────────────────────
-@app.route("/api/test-db")
-def test_db():
-    try:
-        conn = db(); conn.close()
-        return jsonify({"status": "success", "message": "DB OK"})
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
 # ── POSTI ──────────────────────────────────────────────────────────────────────
 @app.route("/api/spots", methods=["GET"])
 def get_spots():

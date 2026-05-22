@@ -2,7 +2,7 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 import psycopg2
 from psycopg2.extras import RealDictCursor
-import hashlib, secrets, math
+import hashlib, secrets, math, os
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {
@@ -30,75 +30,192 @@ def db():
 def hash_pw(p):
     return hashlib.sha256(f"parcheggi_uda_salt{p}".encode()).hexdigest()
 
-# ── Auto-migration: aggiunge colonne/tabelle mancanti senza perdere dati ───────
+# ── Auto-migrazione: crea tabelle italiane se non esistono ─────────────────────
 def run_migrations():
+    """
+    Architettura multilivello:
+    - Livello DB:      tabelle in italiano (utente, parcheggio, prenotazione…)
+    - Livello Backend: traduce DB → JSON con nomi inglesi per il frontend
+    - Livello Frontend: invariato, riceve sempre gli stessi campi JSON
+    """
     stmts = [
-        "ALTER TABLE users ADD COLUMN IF NOT EXISTS loyalty_points INTEGER DEFAULT 0",
-        "ALTER TABLE parking_spots ADD COLUMN IF NOT EXISTS floor_level INTEGER DEFAULT 1",
-        "ALTER TABLE parking_spots ADD COLUMN IF NOT EXISTS fault_report TEXT DEFAULT ''",
-        "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS free_hour_used BOOLEAN DEFAULT FALSE",
-        """UPDATE parking_spots SET floor_level = CASE zone
-            WHEN 'A' THEN 1 WHEN 'B' THEN 2 WHEN 'C' THEN 3 WHEN 'D' THEN 4 ELSE 1
-           END WHERE floor_level = 1""",
-        """CREATE TABLE IF NOT EXISTS loyalty_rewards (
-            id SERIAL PRIMARY KEY,
-            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            points_spent INTEGER NOT NULL DEFAULT 10000,
-            status VARCHAR(20) NOT NULL DEFAULT 'available'
-                CHECK (status IN ('available','used','expired')),
-            booking_id INTEGER REFERENCES bookings(id) ON DELETE SET NULL,
-            created_at TIMESTAMP DEFAULT NOW(),
-            used_at TIMESTAMP
+        # ENUM italiani
+        "CREATE TYPE IF NOT EXISTS stato_posto     AS ENUM ('libero','occupato')",
+        "CREATE TYPE IF NOT EXISTS tipo_parcheggio AS ENUM ('normale','disabili','elettrico','moto','van')",
+        "CREATE TYPE IF NOT EXISTS tipo_veicolo    AS ENUM ('auto','moto','van')",
+        "CREATE TYPE IF NOT EXISTS codice_zona     AS ENUM ('A','B','C','D')",
+
+        # Tabella utente
+        """CREATE TABLE IF NOT EXISTS utente (
+            id             SERIAL       PRIMARY KEY,
+            nome           VARCHAR(100) NOT NULL,
+            email          VARCHAR(150) NOT NULL UNIQUE,
+            password       VARCHAR(255) NOT NULL,
+            telefono       VARCHAR(30)  DEFAULT '',
+            targa          VARCHAR(20)  DEFAULT '',
+            ruolo          VARCHAR(20)  DEFAULT 'utente' CHECK (ruolo IN ('utente','admin')),
+            punti_fedelta  INTEGER      NOT NULL DEFAULT 0,
+            data_creazione TIMESTAMP    DEFAULT NOW()
         )""",
-        "CREATE INDEX IF NOT EXISTS idx_rewards_user ON loyalty_rewards (user_id)",
-        "CREATE INDEX IF NOT EXISTS idx_rewards_status ON loyalty_rewards (status)",
-        """CREATE TABLE IF NOT EXISTS fault_reports (
-            id SERIAL PRIMARY KEY,
-            spot_id VARCHAR(20) NOT NULL REFERENCES parking_spots(id),
-            user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-            report_type VARCHAR(50) NOT NULL DEFAULT 'Altro',
-            description TEXT DEFAULT '',
-            status VARCHAR(20) NOT NULL DEFAULT 'aperta'
-                CHECK (status IN ('aperta','in lavorazione','risolta')),
-            created_at TIMESTAMP DEFAULT NOW(),
-            resolved_at TIMESTAMP
+        "CREATE INDEX IF NOT EXISTS idx_utente_email ON utente (email)",
+
+        # Tabella parcheggio
+        """CREATE TABLE IF NOT EXISTS parcheggio (
+            id                   VARCHAR(4)   PRIMARY KEY,
+            zona                 codice_zona  NOT NULL,
+            stato                stato_posto  NOT NULL DEFAULT 'libero',
+            tipo                 tipo_parcheggio NOT NULL DEFAULT 'normale',
+            manutenzione         BOOLEAN      NOT NULL DEFAULT FALSE,
+            tipo_veicolo         tipo_veicolo NOT NULL DEFAULT 'auto',
+            costo                NUMERIC(5,2) NOT NULL CHECK (costo >= 0),
+            livello              INTEGER      NOT NULL DEFAULT 1,
+            nota_guasto          TEXT         DEFAULT '',
+            ultimo_aggiornamento TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+            CONSTRAINT chk_manutenzione_non_occupato
+                CHECK (NOT (manutenzione = TRUE AND stato = 'occupato'))
         )""",
-        "CREATE INDEX IF NOT EXISTS idx_fault_spot ON fault_reports (spot_id)",
-        "CREATE INDEX IF NOT EXISTS idx_fault_status ON fault_reports (status)",
-        """CREATE TABLE IF NOT EXISTS maintenance_schedule (
-            id SERIAL PRIMARY KEY,
-            zone VARCHAR(1) NOT NULL,
-            scheduled_date DATE NOT NULL,
-            operator VARCHAR(100) NOT NULL,
-            intervention_type VARCHAR(100) NOT NULL DEFAULT 'Pulizia ordinaria',
-            priority VARCHAR(20) NOT NULL DEFAULT 'normale'
-                CHECK (priority IN ('bassa','normale','alta')),
-            notes TEXT DEFAULT '',
-            status VARCHAR(30) NOT NULL DEFAULT 'programmato'
-                CHECK (status IN ('programmato','in corso','completato','annullato')),
-            created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
-            created_at TIMESTAMP DEFAULT NOW(),
-            updated_at TIMESTAMP DEFAULT NOW()
+        "CREATE INDEX IF NOT EXISTS idx_parcheggio_zona  ON parcheggio (zona)",
+        "CREATE INDEX IF NOT EXISTS idx_parcheggio_stato ON parcheggio (stato)",
+
+        # Tabella prenotazione
+        """CREATE TABLE IF NOT EXISTS prenotazione (
+            id                  SERIAL       PRIMARY KEY,
+            codice_prenotazione VARCHAR(20)  NOT NULL UNIQUE,
+            id_utente           INTEGER      NOT NULL REFERENCES utente(id) ON DELETE CASCADE,
+            id_parcheggio       VARCHAR(20)  NOT NULL REFERENCES parcheggio(id),
+            orario_inizio       TIMESTAMP    NOT NULL,
+            orario_fine         TIMESTAMP    NOT NULL,
+            durata_ore          NUMERIC(5,1) NOT NULL,
+            costo_totale        NUMERIC(8,2) NOT NULL,
+            ora_gratis_usata    BOOLEAN      NOT NULL DEFAULT FALSE,
+            stato               VARCHAR(20)  DEFAULT 'attiva'
+                CHECK (stato IN ('attiva','cancellata','completata')),
+            data_creazione      TIMESTAMP    DEFAULT NOW(),
+            CONSTRAINT chk_orari CHECK (orario_fine > orario_inizio)
         )""",
-        "CREATE INDEX IF NOT EXISTS idx_maint_zone ON maintenance_schedule (zone)",
-        "CREATE INDEX IF NOT EXISTS idx_maint_date ON maintenance_schedule (scheduled_date)",
+        "CREATE INDEX IF NOT EXISTS idx_prenotazione_utente ON prenotazione (id_utente)",
+        "CREATE INDEX IF NOT EXISTS idx_prenotazione_stato  ON prenotazione (stato)",
+
+        # Tabella premi_fedelta
+        """CREATE TABLE IF NOT EXISTS premi_fedelta (
+            id              SERIAL      PRIMARY KEY,
+            id_utente       INTEGER     NOT NULL REFERENCES utente(id) ON DELETE CASCADE,
+            punti_spesi     INTEGER     NOT NULL DEFAULT 10000,
+            stato           VARCHAR(20) NOT NULL DEFAULT 'disponibile'
+                CHECK (stato IN ('disponibile','usato','scaduto')),
+            id_prenotazione INTEGER     REFERENCES prenotazione(id) ON DELETE SET NULL,
+            data_creazione  TIMESTAMP   DEFAULT NOW(),
+            data_utilizzo   TIMESTAMP
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_premi_utente ON premi_fedelta (id_utente)",
+        "CREATE INDEX IF NOT EXISTS idx_premi_stato  ON premi_fedelta (stato)",
+
+        # Tabella guasto
+        """CREATE TABLE IF NOT EXISTS guasto (
+            id               SERIAL      PRIMARY KEY,
+            id_parcheggio    VARCHAR(20) NOT NULL REFERENCES parcheggio(id),
+            id_utente        INTEGER     REFERENCES utente(id) ON DELETE SET NULL,
+            tipo             VARCHAR(50) NOT NULL DEFAULT 'Altro',
+            descrizione      TEXT        DEFAULT '',
+            stato            VARCHAR(20) NOT NULL DEFAULT 'aperta'
+                CHECK (stato IN ('aperta','in lavorazione','risolta')),
+            data_segnalazione TIMESTAMP  DEFAULT NOW(),
+            data_risoluzione  TIMESTAMP
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_guasto_parcheggio ON guasto (id_parcheggio)",
+        "CREATE INDEX IF NOT EXISTS idx_guasto_stato      ON guasto (stato)",
+
+        # Tabella manutenzione
+        """CREATE TABLE IF NOT EXISTS manutenzione (
+            id                 SERIAL      PRIMARY KEY,
+            zona               codice_zona NOT NULL,
+            data_programmata   DATE        NOT NULL,
+            operatore          VARCHAR(100) NOT NULL,
+            tipo               VARCHAR(100) NOT NULL DEFAULT 'Pulizia ordinaria',
+            priorita           VARCHAR(20) NOT NULL DEFAULT 'normale'
+                CHECK (priorita IN ('bassa','normale','alta')),
+            note               TEXT        DEFAULT '',
+            stato              VARCHAR(30) NOT NULL DEFAULT 'programmato'
+                CHECK (stato IN ('programmato','in corso','completato','annullato')),
+            id_creatore        INTEGER     REFERENCES utente(id) ON DELETE SET NULL,
+            data_creazione     TIMESTAMP   DEFAULT NOW(),
+            data_aggiornamento TIMESTAMP   DEFAULT NOW()
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_manutenzione_zona  ON manutenzione (zona)",
+        "CREATE INDEX IF NOT EXISTS idx_manutenzione_data  ON manutenzione (data_programmata)",
+        "CREATE INDEX IF NOT EXISTS idx_manutenzione_stato ON manutenzione (stato)",
     ]
     try:
         conn = psycopg2.connect(**DB_PARAMS)
         cur = conn.cursor()
         for s in stmts:
             try:
-                cur.execute(s)
-                conn.commit()
+                cur.execute(s); conn.commit()
             except Exception as e:
                 conn.rollback()
-                print(f"  migration skipped: {str(e)[:60]}")
+                print(f"  migration: {str(e)[:70]}")
         cur.close(); conn.close()
-        print("✅ DB migrations OK")
+        print("✅ DB italiano OK")
     except Exception as e:
-        print(f"⚠️  Migration warning: {e}")
+        print(f"⚠️  Connessione DB: {e}")
 
 run_migrations()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LIVELLO TRADUZIONE: DB italiano → JSON inglese per il frontend
+# Il frontend riceve sempre gli stessi campi — non sa nulla del DB
+# ══════════════════════════════════════════════════════════════════════════════
+
+def traduce_stato_posto(stato_it):
+    """libero/occupato → free/occupied"""
+    return {'libero': 'free', 'occupato': 'occupied'}.get(stato_it, stato_it)
+
+def traduce_tipo(tipo_it):
+    """normale/disabili/elettrico/moto/van → normal/disabled/electric/motorcycle/van"""
+    return {'normale':'normal','disabili':'disabled','elettrico':'electric',
+            'moto':'motorcycle','van':'van'}.get(tipo_it, tipo_it)
+
+def traduce_veicolo(v_it):
+    """auto/moto/van → car/motorcycle/van"""
+    return {'auto':'car','moto':'motorcycle','van':'van'}.get(v_it, v_it)
+
+def traduce_stato_prenotazione(s_it):
+    """attiva/cancellata/completata → active/cancelled/completed"""
+    return {'attiva':'active','cancellata':'cancelled','completata':'completed'}.get(s_it, s_it)
+
+def traduce_stato_premio(s_it):
+    """disponibile/usato/scaduto → available/used/expired"""
+    return {'disponibile':'available','usato':'used','scaduto':'expired'}.get(s_it, s_it)
+
+def traduce_ruolo(r_it):
+    """utente/admin → user/admin"""
+    return {'utente':'user','admin':'admin'}.get(r_it, r_it)
+
+# Inversi (JSON inglese → DB italiano) per INSERT/UPDATE
+def it_stato_posto(s_en):
+    return {'free':'libero','occupied':'occupato'}.get(s_en, s_en)
+
+def it_tipo(t_en):
+    return {'normal':'normale','disabled':'disabili','electric':'elettrico',
+            'motorcycle':'moto','van':'van'}.get(t_en, t_en)
+
+def it_veicolo(v_en):
+    return {'car':'auto','motorcycle':'moto','van':'van'}.get(v_en, v_en)
+
+def it_ruolo(r_en):
+    return {'user':'utente','admin':'admin'}.get(r_en, r_en)
+
+def it_stato_prenotazione(s_en):
+    return {'active':'attiva','cancelled':'cancellata','completed':'completata'}.get(s_en, s_en)
+
+# ── TEST ───────────────────────────────────────────────────────────────────────
+@app.route("/api/test-db")
+def test_db():
+    try:
+        conn = db(); conn.close()
+        return jsonify({"status":"success","message":"DB italiano OK"})
+    except Exception as e:
+        return jsonify({"status":"error","message":str(e)}), 500
 
 # ── POSTI ──────────────────────────────────────────────────────────────────────
 @app.route("/api/spots", methods=["GET"])
@@ -106,14 +223,28 @@ def get_spots():
     try:
         conn = db(); cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute("""
-            SELECT id, zone, status, parking_type, maintenance, vehicle_type,
-                   cost::FLOAT, floor_level,
-                   COALESCE(fault_report,'') AS fault_report,
-                   TO_CHAR(last_updated,'DD/MM/YYYY, HH24:MI:SS') AS last_updated
-            FROM parking_spots ORDER BY id
+            SELECT id, zona, stato, tipo, manutenzione, tipo_veicolo,
+                   costo::FLOAT, livello, COALESCE(nota_guasto,'') AS nota_guasto,
+                   TO_CHAR(ultimo_aggiornamento,'DD/MM/YYYY, HH24:MI:SS') AS ultimo_aggiornamento
+            FROM parcheggio ORDER BY id
         """)
         rows = cur.fetchall(); cur.close(); conn.close()
-        return jsonify([dict(r) for r in rows])
+        result = []
+        for r in rows:
+            # Traduce i valori DB → JSON inglese atteso dal frontend
+            result.append({
+                "id":           r["id"],
+                "zone":         r["zona"],
+                "status":       traduce_stato_posto(r["stato"]),
+                "parking_type": traduce_tipo(r["tipo"]),
+                "maintenance":  r["manutenzione"],
+                "vehicle_type": traduce_veicolo(r["tipo_veicolo"]),
+                "cost":         r["costo"],
+                "floor_level":  r["livello"],
+                "fault_report": r["nota_guasto"],
+                "last_updated": r["ultimo_aggiornamento"],
+            })
+        return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -123,79 +254,72 @@ def update_spot(spot_id):
         data = request.json
         conn = db(); cur = conn.cursor()
         cur.execute("""
-            UPDATE parking_spots
-            SET zone=%s, status=%s, parking_type=%s, maintenance=%s,
-                vehicle_type=%s, cost=%s, last_updated=NOW()
+            UPDATE parcheggio
+            SET zona=%s, stato=%s, tipo=%s, manutenzione=%s,
+                tipo_veicolo=%s, costo=%s, ultimo_aggiornamento=NOW()
             WHERE id=%s
-            RETURNING TO_CHAR(last_updated,'DD/MM/YYYY, HH24:MI:SS')
-        """, (data['zone'], data['status'], data['parking_type'],
-              data['maintenance'], data['vehicle_type'], data['cost'], spot_id))
+            RETURNING TO_CHAR(ultimo_aggiornamento,'DD/MM/YYYY, HH24:MI:SS')
+        """, (data['zone'], it_stato_posto(data['status']), it_tipo(data['parking_type']),
+              data['maintenance'], it_veicolo(data['vehicle_type']), data['cost'], spot_id))
         res = cur.fetchone(); conn.commit(); cur.close(); conn.close()
-        return jsonify({"message": "OK", "last_updated": res[0]})
+        return jsonify({"message":"OK","last_updated": res[0]})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ── SEGNALAZIONI GUASTO ────────────────────────────────────────────────────────
+# ── GUASTO ─────────────────────────────────────────────────────────────────────
 @app.route("/api/spots/<spot_id>/fault", methods=["POST","OPTIONS"])
 def report_fault(spot_id):
     if request.method == "OPTIONS":
         return jsonify({}), 200
     try:
-        data = request.json or {}
-        report_type = data.get("report_type", "Altro").strip()
-        description = data.get("description", "").strip()
-        user_id     = data.get("user_id")
-        if not report_type:
-            return jsonify({"error": "Tipo segnalazione obbligatorio"}), 400
+        data        = request.json or {}
+        tipo        = data.get("report_type", "Altro").strip()
+        descrizione = data.get("description", "").strip()
+        id_utente   = data.get("user_id")
+        if not tipo:
+            return jsonify({"error":"Tipo segnalazione obbligatorio"}), 400
 
         conn = db(); cur = conn.cursor()
-
-        # Verifica che il posto esista
-        cur.execute("SELECT status FROM parking_spots WHERE id=%s", (spot_id,))
+        cur.execute("SELECT stato FROM parcheggio WHERE id=%s", (spot_id,))
         row = cur.fetchone()
         if not row:
             cur.close(); conn.close()
             return jsonify({"error": f"Posto {spot_id} non trovato"}), 404
 
-        spot_status = row[0]
-        fault_note  = f"{report_type}: {description}" if description else report_type
-        fault_id    = None
+        stato_attuale = row[0]
+        nota = f"{tipo}: {descrizione}" if descrizione else tipo
+        guasto_id = None
 
-        # Salva in fault_reports
         try:
             cur.execute("""
-                INSERT INTO fault_reports (spot_id, user_id, report_type, description, status)
-                VALUES (%s, %s, %s, %s, 'aperta') RETURNING id
-            """, (spot_id, user_id or None, report_type, description))
-            fault_id = cur.fetchone()[0]
+                INSERT INTO guasto (id_parcheggio, id_utente, tipo, descrizione, stato)
+                VALUES (%s,%s,%s,%s,'aperta') RETURNING id
+            """, (spot_id, id_utente or None, tipo, descrizione))
+            guasto_id = cur.fetchone()[0]
         except Exception as e:
             conn.rollback()
-            print(f"fault_reports insert skipped: {e}")
+            print(f"guasto insert skipped: {e}")
 
-        # Aggiorna il posto — controlla il constraint
-        if spot_status == 'free':
-            # Posto libero: metti in manutenzione
+        if stato_attuale == 'libero':
             try:
                 cur.execute("""
-                    UPDATE parking_spots
-                    SET maintenance=TRUE, fault_report=%s, last_updated=NOW()
+                    UPDATE parcheggio
+                    SET manutenzione=TRUE, nota_guasto=%s, ultimo_aggiornamento=NOW()
                     WHERE id=%s
-                """, (fault_note, spot_id))
+                """, (nota, spot_id))
             except Exception:
                 conn.rollback()
-                cur.execute("UPDATE parking_spots SET maintenance=TRUE, last_updated=NOW() WHERE id=%s", (spot_id,))
+                cur.execute("UPDATE parcheggio SET manutenzione=TRUE, ultimo_aggiornamento=NOW() WHERE id=%s", (spot_id,))
             msg = "Segnalazione salvata — posto messo in manutenzione"
         else:
-            # Posto occupato: salva solo la nota (non può essere maintenance+occupied)
             try:
-                cur.execute("UPDATE parking_spots SET fault_report=%s, last_updated=NOW() WHERE id=%s",
-                            (fault_note, spot_id))
+                cur.execute("UPDATE parcheggio SET nota_guasto=%s, ultimo_aggiornamento=NOW() WHERE id=%s", (nota, spot_id))
             except Exception:
                 conn.rollback()
-            msg = "Segnalazione registrata — il posto sarà messo in manutenzione al termine della sosta"
+            msg = "Segnalazione registrata — manutenzione applicata al termine della sosta"
 
         conn.commit(); cur.close(); conn.close()
-        return jsonify({"message": msg, "id": fault_id})
+        return jsonify({"message": msg, "id": guasto_id})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -204,14 +328,15 @@ def get_faults():
     try:
         conn = db(); cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute("""
-            SELECT fr.id, fr.spot_id, fr.report_type, fr.description, fr.status,
-                   fr.created_at, fr.resolved_at,
-                   COALESCE(ps.zone::TEXT, '?') AS zone,
-                   COALESCE(u.name, 'Anonimo')  AS user_name
-            FROM fault_reports fr
-            LEFT JOIN parking_spots ps ON fr.spot_id = ps.id
-            LEFT JOIN users u          ON fr.user_id  = u.id
-            ORDER BY fr.created_at DESC
+            SELECT g.id, g.id_parcheggio AS spot_id, g.tipo AS report_type,
+                   g.descrizione AS description, g.stato AS status,
+                   g.data_segnalazione AS created_at, g.data_risoluzione AS resolved_at,
+                   COALESCE(p.zona::TEXT,'?') AS zone,
+                   COALESCE(u.nome,'Anonimo')  AS user_name
+            FROM guasto g
+            LEFT JOIN parcheggio p ON g.id_parcheggio = p.id
+            LEFT JOIN utente u     ON g.id_utente = u.id
+            ORDER BY g.data_segnalazione DESC
         """)
         rows = cur.fetchall(); cur.close(); conn.close()
         result = []
@@ -227,32 +352,22 @@ def get_faults():
 @app.route("/api/faults/<int:fault_id>", methods=["PUT"])
 def update_fault(fault_id):
     try:
-        data       = request.json
-        new_status = data.get("status")
+        new_status = request.json.get("status")
         conn = db(); cur = conn.cursor(cursor_factory=RealDictCursor)
         if new_status == 'risolta':
             cur.execute("""
-                UPDATE fault_reports SET status=%s, resolved_at=NOW()
-                WHERE id=%s RETURNING spot_id
-            """, (new_status, fault_id))
+                UPDATE guasto SET stato='risolta', data_risoluzione=NOW()
+                WHERE id=%s RETURNING id_parcheggio
+            """, (fault_id,))
             row = cur.fetchone()
             if row:
-                spot_id = row['spot_id']
-                cur.execute("""
-                    SELECT COUNT(*) AS cnt FROM fault_reports
-                    WHERE spot_id=%s AND status != 'risolta'
-                """, (spot_id,))
-                cnt = cur.fetchone()['cnt']
-                if cnt == 0:
-                    cur.execute("""
-                        UPDATE parking_spots
-                        SET maintenance=FALSE, fault_report='', last_updated=NOW()
-                        WHERE id=%s
-                    """, (spot_id,))
+                cur.execute("SELECT COUNT(*) AS cnt FROM guasto WHERE id_parcheggio=%s AND stato!='risolta'", (row['id_parcheggio'],))
+                if cur.fetchone()['cnt'] == 0:
+                    cur.execute("UPDATE parcheggio SET manutenzione=FALSE, nota_guasto='', ultimo_aggiornamento=NOW() WHERE id=%s", (row['id_parcheggio'],))
         else:
-            cur.execute("UPDATE fault_reports SET status=%s WHERE id=%s", (new_status, fault_id))
+            cur.execute("UPDATE guasto SET stato=%s WHERE id=%s", (new_status, fault_id))
         conn.commit(); cur.close(); conn.close()
-        return jsonify({"message": "Aggiornato"})
+        return jsonify({"message":"Aggiornato"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -265,19 +380,25 @@ def register():
             if not data.get(f):
                 return jsonify({"error": f"Campo '{f}' obbligatorio"}), 400
         conn = db(); cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("SELECT id FROM users WHERE email=%s", (data["email"],))
+        cur.execute("SELECT id FROM utente WHERE email=%s", (data["email"],))
         if cur.fetchone():
             cur.close(); conn.close()
-            return jsonify({"error": "Email già registrata"}), 409
+            return jsonify({"error":"Email già registrata"}), 409
         cur.execute("""
-            INSERT INTO users (name, email, password_hash, phone, plate, loyalty_points)
-            VALUES (%s,%s,%s,%s,%s,0)
-            RETURNING id, name, email, phone, plate, role, loyalty_points,
-                      TO_CHAR(created_at,'DD/MM/YYYY') AS created_at
+            INSERT INTO utente (nome, email, password, telefono, targa, ruolo, punti_fedelta)
+            VALUES (%s,%s,%s,%s,%s,'utente',0)
+            RETURNING id, nome, email, telefono, targa, ruolo, punti_fedelta,
+                      TO_CHAR(data_creazione,'DD/MM/YYYY') AS data_creazione
         """, (data["name"], data["email"], hash_pw(data["password"]),
               data.get("phone",""), data.get("plate","")))
-        user = dict(cur.fetchone()); conn.commit(); cur.close(); conn.close()
-        return jsonify({"message": "Registrazione completata", "user": user}), 201
+        u = dict(cur.fetchone()); conn.commit(); cur.close(); conn.close()
+        return jsonify({"message":"Registrazione completata", "user": {
+            "id": u["id"], "name": u["nome"], "email": u["email"],
+            "phone": u["telefono"], "plate": u["targa"],
+            "role": traduce_ruolo(u["ruolo"]),
+            "loyalty_points": u["punti_fedelta"],
+            "created_at": u["data_creazione"]
+        }}), 201
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -286,33 +407,29 @@ def login():
     try:
         data = request.json
         if not data.get("email") or not data.get("password"):
-            return jsonify({"error": "Email e password obbligatori"}), 400
+            return jsonify({"error":"Email e password obbligatori"}), 400
         conn = db(); cur = conn.cursor(cursor_factory=RealDictCursor)
-        try:
-            cur.execute("""
-                SELECT id, name, email, phone, plate, role, loyalty_points,
-                       TO_CHAR(created_at,'DD/MM/YYYY') AS created_at
-                FROM users WHERE email=%s AND password_hash=%s
-            """, (data["email"], hash_pw(data["password"])))
-        except Exception:
-            conn.rollback()
-            cur.execute("""
-                SELECT id, name, email, phone, plate, role,
-                       TO_CHAR(created_at,'DD/MM/YYYY') AS created_at
-                FROM users WHERE email=%s AND password_hash=%s
-            """, (data["email"], hash_pw(data["password"])))
-        user = cur.fetchone(); cur.close(); conn.close()
-        if not user:
-            return jsonify({"error": "Credenziali non valide"}), 401
-        result = dict(user)
-        result.setdefault("loyalty_points", 0)
-        return jsonify({"message": "Login effettuato", "user": result})
+        cur.execute("""
+            SELECT id, nome, email, telefono, targa, ruolo, punti_fedelta,
+                   TO_CHAR(data_creazione,'DD/MM/YYYY') AS data_creazione
+            FROM utente WHERE email=%s AND password=%s
+        """, (data["email"], hash_pw(data["password"])))
+        u = cur.fetchone(); cur.close(); conn.close()
+        if not u:
+            return jsonify({"error":"Credenziali non valide"}), 401
+        return jsonify({"message":"Login effettuato", "user": {
+            "id": u["id"], "name": u["nome"], "email": u["email"],
+            "phone": u["telefono"], "plate": u["targa"],
+            "role": traduce_ruolo(u["ruolo"]),
+            "loyalty_points": u["punti_fedelta"],
+            "created_at": u["data_creazione"]
+        }})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/auth/logout", methods=["POST"])
 def logout():
-    return jsonify({"message": "Logout effettuato"})
+    return jsonify({"message":"Logout effettuato"})
 
 @app.route("/api/users/<int:user_id>", methods=["PUT"])
 def update_user(user_id):
@@ -320,49 +437,52 @@ def update_user(user_id):
         data = request.json
         conn = db(); cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute("""
-            UPDATE users SET name=%s, phone=%s, plate=%s WHERE id=%s
-            RETURNING id, name, email, phone, plate, role, loyalty_points,
-                      TO_CHAR(created_at,'DD/MM/YYYY') AS created_at
+            UPDATE utente SET nome=%s, telefono=%s, targa=%s WHERE id=%s
+            RETURNING id, nome, email, telefono, targa, ruolo, punti_fedelta,
+                      TO_CHAR(data_creazione,'DD/MM/YYYY') AS data_creazione
         """, (data["name"], data.get("phone",""), data.get("plate",""), user_id))
-        user = cur.fetchone(); conn.commit(); cur.close(); conn.close()
-        if not user:
-            return jsonify({"error": "Utente non trovato"}), 404
-        return jsonify(dict(user))
+        u = cur.fetchone(); conn.commit(); cur.close(); conn.close()
+        if not u:
+            return jsonify({"error":"Utente non trovato"}), 404
+        return jsonify({"id":u["id"],"name":u["nome"],"email":u["email"],
+            "phone":u["telefono"],"plate":u["targa"],
+            "role":traduce_ruolo(u["ruolo"]),
+            "loyalty_points":u["punti_fedelta"],"created_at":u["data_creazione"]})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ── LOYALTY ────────────────────────────────────────────────────────────────────
+# ── FEDELTÀ ────────────────────────────────────────────────────────────────────
 @app.route("/api/users/<int:user_id>/loyalty", methods=["GET"])
 def get_loyalty(user_id):
     try:
         conn = db(); cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("SELECT loyalty_points FROM users WHERE id=%s", (user_id,))
+        cur.execute("SELECT punti_fedelta FROM utente WHERE id=%s", (user_id,))
         row = cur.fetchone()
-        cur.execute("SELECT COUNT(*) AS cnt FROM loyalty_rewards WHERE user_id=%s AND status='available'", (user_id,))
+        cur.execute("SELECT COUNT(*) AS cnt FROM premi_fedelta WHERE id_utente=%s AND stato='disponibile'", (user_id,))
         rewards = cur.fetchone()
         cur.close(); conn.close()
         return jsonify({
-            "loyalty_points": row['loyalty_points'] if row else 0,
+            "loyalty_points":       row['punti_fedelta'] if row else 0,
             "free_hours_available": int(rewards['cnt']) if rewards else 0
         })
-    except Exception as e:
-        return jsonify({"loyalty_points": 0, "free_hours_available": 0})
+    except Exception:
+        return jsonify({"loyalty_points":0,"free_hours_available":0})
 
 @app.route("/api/users/<int:user_id>/loyalty/redeem", methods=["POST"])
 def redeem_loyalty(user_id):
     try:
         conn = db(); cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("SELECT loyalty_points FROM users WHERE id=%s", (user_id,))
+        cur.execute("SELECT punti_fedelta FROM utente WHERE id=%s", (user_id,))
         row = cur.fetchone()
-        if not row or row['loyalty_points'] < 10000:
+        if not row or row['punti_fedelta'] < 10000:
             cur.close(); conn.close()
-            return jsonify({"error": "Punti insufficienti (servono 10.000)"}), 400
-        cur.execute("UPDATE users SET loyalty_points = loyalty_points - 10000 WHERE id=%s RETURNING loyalty_points", (user_id,))
-        new_pts = cur.fetchone()['loyalty_points']
-        cur.execute("INSERT INTO loyalty_rewards (user_id, points_spent, status) VALUES (%s,10000,'available') RETURNING id", (user_id,))
+            return jsonify({"error":"Punti insufficienti (servono 10.000)"}), 400
+        cur.execute("UPDATE utente SET punti_fedelta=punti_fedelta-10000 WHERE id=%s RETURNING punti_fedelta", (user_id,))
+        new_pts = cur.fetchone()['punti_fedelta']
+        cur.execute("INSERT INTO premi_fedelta (id_utente,punti_spesi,stato) VALUES (%s,10000,'disponibile') RETURNING id", (user_id,))
         reward_id = cur.fetchone()['id']
         conn.commit(); cur.close(); conn.close()
-        return jsonify({"message": "Premio riscattato!", "reward_id": reward_id, "loyalty_points_remaining": new_pts})
+        return jsonify({"message":"Premio riscattato!","reward_id":reward_id,"loyalty_points_remaining":new_pts})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -371,16 +491,19 @@ def get_rewards(user_id):
     try:
         conn = db(); cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute("""
-            SELECT lr.id, lr.points_spent, lr.status, lr.created_at, lr.used_at,
-                   b.booking_code, b.spot_id, b.start_time
-            FROM loyalty_rewards lr
-            LEFT JOIN bookings b ON lr.booking_id = b.id
-            WHERE lr.user_id = %s ORDER BY lr.created_at DESC
+            SELECT pf.id, pf.punti_spesi AS points_spent,
+                   pf.stato, pf.data_creazione AS created_at, pf.data_utilizzo AS used_at,
+                   p.codice_prenotazione AS booking_code,
+                   p.id_parcheggio AS spot_id, p.orario_inizio AS start_time
+            FROM premi_fedelta pf
+            LEFT JOIN prenotazione p ON pf.id_prenotazione = p.id
+            WHERE pf.id_utente=%s ORDER BY pf.data_creazione DESC
         """, (user_id,))
         rows = cur.fetchall(); cur.close(); conn.close()
         result = []
         for r in rows:
             row = dict(r)
+            row['status']     = traduce_stato_premio(row.pop('stato'))
             row['created_at'] = row['created_at'].strftime('%d/%m/%Y %H:%M') if row['created_at'] else ''
             row['used_at']    = row['used_at'].strftime('%d/%m/%Y %H:%M')    if row['used_at']    else ''
             if row.get('start_time'):
@@ -397,26 +520,31 @@ def get_bookings():
         user_id = request.args.get("user_id")
         conn = db(); cur = conn.cursor(cursor_factory=RealDictCursor)
         q = """
-            SELECT b.id, b.booking_code, b.spot_id, b.user_id, b.status,
-                   b.duration_hours::FLOAT, b.total_cost::FLOAT, b.free_hour_used,
-                   TO_CHAR(b.start_time,'DD/MM/YYYY, HH24:MI') AS start_time,
-                   TO_CHAR(b.end_time,  'DD/MM/YYYY, HH24:MI') AS end_time,
-                   b.end_time AS end_time_raw,
-                   TO_CHAR(b.created_at,'DD/MM/YYYY, HH24:MI') AS created_at,
-                   p.zone, p.parking_type, p.cost::FLOAT AS hourly_cost, p.floor_level,
-                   u.name AS user_name, u.email AS user_email, u.plate AS user_plate
-            FROM bookings b
-            JOIN parking_spots p ON b.spot_id = p.id
-            LEFT JOIN users u    ON b.user_id  = u.id
+            SELECT p.id, p.codice_prenotazione AS booking_code,
+                   p.id_parcheggio AS spot_id, p.id_utente AS user_id,
+                   p.stato, p.durata_ore::FLOAT AS duration_hours,
+                   p.costo_totale::FLOAT AS total_cost, p.ora_gratis_usata AS free_hour_used,
+                   TO_CHAR(p.orario_inizio,'DD/MM/YYYY, HH24:MI') AS start_time,
+                   TO_CHAR(p.orario_fine,  'DD/MM/YYYY, HH24:MI') AS end_time,
+                   p.orario_fine AS end_time_raw,
+                   TO_CHAR(p.data_creazione,'DD/MM/YYYY, HH24:MI') AS created_at,
+                   pa.zona AS zone, pa.tipo AS parking_type,
+                   pa.costo::FLOAT AS hourly_cost, pa.livello AS floor_level,
+                   u.nome AS user_name, u.email AS user_email, u.targa AS user_plate
+            FROM prenotazione p
+            JOIN parcheggio pa ON p.id_parcheggio = pa.id
+            LEFT JOIN utente u ON p.id_utente = u.id
         """
         if user_id:
-            cur.execute(q + " WHERE b.user_id=%s ORDER BY b.created_at DESC", (user_id,))
+            cur.execute(q + " WHERE p.id_utente=%s ORDER BY p.data_creazione DESC", (user_id,))
         else:
-            cur.execute(q + " ORDER BY b.created_at DESC")
+            cur.execute(q + " ORDER BY p.data_creazione DESC")
         rows = cur.fetchall(); cur.close(); conn.close()
         result = []
         for r in rows:
             row = dict(r)
+            row['status']       = traduce_stato_prenotazione(row.pop('stato'))
+            row['parking_type'] = traduce_tipo(row['parking_type'])
             if row.get('end_time_raw'):
                 row['end_time_raw'] = row['end_time_raw'].isoformat()
             result.append(row)
@@ -432,57 +560,59 @@ def create_booking():
             if data.get(f) is None:
                 return jsonify({"error": f"Campo '{f}' obbligatorio"}), 400
 
-        use_free = data.get("use_free_hour", False)
+        use_free  = data.get("use_free_hour", False)
         reward_id = data.get("reward_id")
 
         conn = db(); cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("SELECT status, maintenance FROM parking_spots WHERE id=%s", (data["spot_id"],))
+        cur.execute("SELECT stato, manutenzione FROM parcheggio WHERE id=%s", (data["spot_id"],))
         spot = cur.fetchone()
         if not spot:
-            return jsonify({"error": "Posto non trovato"}), 404
-        if spot["maintenance"]:
-            return jsonify({"error": "Posto in manutenzione"}), 409
+            return jsonify({"error":"Posto non trovato"}), 404
+        if spot["manutenzione"]:
+            return jsonify({"error":"Posto in manutenzione"}), 409
 
         cur.execute("""
-            SELECT id FROM bookings WHERE spot_id=%s AND status='active'
-            AND NOT (end_time <= %s OR start_time >= %s)
+            SELECT id FROM prenotazione WHERE id_parcheggio=%s AND stato='attiva'
+            AND NOT (orario_fine <= %s OR orario_inizio >= %s)
         """, (data["spot_id"], data["start_time"], data["end_time"]))
         if cur.fetchone():
-            return jsonify({"error": "Posto già prenotato in questo intervallo"}), 409
+            return jsonify({"error":"Posto già prenotato in questo intervallo"}), 409
 
         if use_free and reward_id:
-            cur.execute("SELECT id FROM loyalty_rewards WHERE id=%s AND user_id=%s AND status='available'",
+            cur.execute("SELECT id FROM premi_fedelta WHERE id=%s AND id_utente=%s AND stato='disponibile'",
                         (reward_id, data["user_id"]))
             if not cur.fetchone():
                 cur.close(); conn.close()
-                return jsonify({"error": "Premio non valido o già usato"}), 400
+                return jsonify({"error":"Premio non valido o già usato"}), 400
 
-        code = "PRK-" + secrets.token_hex(4).upper()
+        codice = "PRK-" + secrets.token_hex(4).upper()
         cur.execute("""
-            INSERT INTO bookings
-                (booking_code, user_id, spot_id, start_time, end_time,
-                 duration_hours, total_cost, free_hour_used, status)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'active')
-            RETURNING id, booking_code, TO_CHAR(created_at,'DD/MM/YYYY, HH24:MI') AS created_at
-        """, (code, data["user_id"], data["spot_id"],
+            INSERT INTO prenotazione
+                (codice_prenotazione, id_utente, id_parcheggio,
+                 orario_inizio, orario_fine, durata_ore, costo_totale,
+                 ora_gratis_usata, stato)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'attiva')
+            RETURNING id, codice_prenotazione,
+                      TO_CHAR(data_creazione,'DD/MM/YYYY, HH24:MI') AS data_creazione
+        """, (codice, data["user_id"], data["spot_id"],
               data["start_time"], data["end_time"],
               data["duration_hours"], data["total_cost"], use_free))
         booking = dict(cur.fetchone())
 
-        cur.execute("UPDATE parking_spots SET status='occupied', last_updated=NOW() WHERE id=%s", (data["spot_id"],))
+        cur.execute("UPDATE parcheggio SET stato='occupato', ultimo_aggiornamento=NOW() WHERE id=%s", (data["spot_id"],))
         pts = int(float(data["duration_hours"]) * 100)
-        cur.execute("UPDATE users SET loyalty_points = loyalty_points + %s WHERE id=%s", (pts, data["user_id"]))
+        cur.execute("UPDATE utente SET punti_fedelta=punti_fedelta+%s WHERE id=%s", (pts, data["user_id"]))
 
         if use_free and reward_id:
-            cur.execute("UPDATE loyalty_rewards SET status='used', booking_id=%s, used_at=NOW() WHERE id=%s",
+            cur.execute("UPDATE premi_fedelta SET stato='usato', id_prenotazione=%s, data_utilizzo=NOW() WHERE id=%s",
                         (booking["id"], reward_id))
 
         conn.commit(); cur.close(); conn.close()
         return jsonify({
-            "message": "Prenotazione creata",
-            "booking_id": booking["id"],
-            "booking_code": booking["booking_code"],
-            "created_at": booking["created_at"],
+            "message":"Prenotazione creata",
+            "booking_id":   booking["id"],
+            "booking_code": booking["codice_prenotazione"],
+            "created_at":   booking["data_creazione"],
             "loyalty_points_earned": pts
         }), 201
     except Exception as e:
@@ -494,15 +624,15 @@ def update_booking(booking_id):
         data = request.json
         conn = db(); cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute("""
-            UPDATE bookings SET end_time=%s, duration_hours=%s, total_cost=%s
+            UPDATE prenotazione SET orario_fine=%s, durata_ore=%s, costo_totale=%s
             WHERE id=%s
-            RETURNING id, booking_code,
-                      TO_CHAR(end_time,'DD/MM/YYYY, HH24:MI') AS end_time,
-                      end_time AS end_time_raw
+            RETURNING id, codice_prenotazione AS booking_code,
+                      TO_CHAR(orario_fine,'DD/MM/YYYY, HH24:MI') AS end_time,
+                      orario_fine AS end_time_raw
         """, (data["end_time"], data["duration_hours"], data["total_cost"], booking_id))
         b = cur.fetchone(); conn.commit(); cur.close(); conn.close()
         if not b:
-            return jsonify({"error": "Non trovata"}), 404
+            return jsonify({"error":"Non trovata"}), 404
         row = dict(b)
         row['end_time_raw'] = row['end_time_raw'].isoformat()
         return jsonify(row)
@@ -513,14 +643,14 @@ def update_booking(booking_id):
 def cancel_booking(booking_id):
     try:
         conn = db(); cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("SELECT spot_id FROM bookings WHERE id=%s AND status='active'", (booking_id,))
+        cur.execute("SELECT id_parcheggio FROM prenotazione WHERE id=%s AND stato='attiva'", (booking_id,))
         b = cur.fetchone()
         if not b:
-            return jsonify({"error": "Non trovata o già cancellata"}), 404
-        cur.execute("UPDATE bookings SET status='cancelled' WHERE id=%s", (booking_id,))
-        cur.execute("UPDATE parking_spots SET status='free', last_updated=NOW() WHERE id=%s", (b["spot_id"],))
+            return jsonify({"error":"Non trovata o già cancellata"}), 404
+        cur.execute("UPDATE prenotazione SET stato='cancellata' WHERE id=%s", (booking_id,))
+        cur.execute("UPDATE parcheggio SET stato='libero', ultimo_aggiornamento=NOW() WHERE id=%s", (b["id_parcheggio"],))
         conn.commit(); cur.close(); conn.close()
-        return jsonify({"message": "Cancellata"})
+        return jsonify({"message":"Cancellata"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -530,12 +660,13 @@ def get_maintenance():
     try:
         conn = db(); cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute("""
-            SELECT id, zone, intervention_type AS type, priority, notes, status, operator,
-                   TO_CHAR(scheduled_date,'DD/MM/YYYY') AS date,
-                   scheduled_date::TEXT AS date_iso,
-                   TO_CHAR(created_at,'DD/MM/YYYY HH24:MI') AS created_at,
-                   TO_CHAR(updated_at,'DD/MM/YYYY HH24:MI') AS updated_at
-            FROM maintenance_schedule ORDER BY scheduled_date DESC
+            SELECT id, zona AS zone, tipo AS type, priorita AS priority,
+                   note AS notes, stato AS status, operatore AS operator,
+                   TO_CHAR(data_programmata,'DD/MM/YYYY') AS date,
+                   data_programmata::TEXT AS date_iso,
+                   TO_CHAR(data_creazione,'DD/MM/YYYY HH24:MI') AS created_at,
+                   TO_CHAR(data_aggiornamento,'DD/MM/YYYY HH24:MI') AS updated_at
+            FROM manutenzione ORDER BY data_programmata DESC
         """)
         rows = cur.fetchall(); cur.close(); conn.close()
         return jsonify([dict(r) for r in rows])
@@ -548,16 +679,15 @@ def add_maintenance():
         data = request.json
         conn = db(); cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute("""
-            INSERT INTO maintenance_schedule
-                (zone, scheduled_date, operator, intervention_type, priority, notes, status)
+            INSERT INTO manutenzione
+                (zona, data_programmata, operatore, tipo, priorita, note, stato)
             VALUES (%s,%s,%s,%s,%s,%s,'programmato')
-            RETURNING id, TO_CHAR(scheduled_date,'DD/MM/YYYY') AS date
+            RETURNING id, TO_CHAR(data_programmata,'DD/MM/YYYY') AS date
         """, (data['zone'], data['date_iso'], data['operator'],
               data.get('type','Pulizia ordinaria'),
-              data.get('priority','normale'),
-              data.get('notes','')))
+              data.get('priority','normale'), data.get('notes','')))
         row = dict(cur.fetchone()); conn.commit(); cur.close(); conn.close()
-        return jsonify({"message": "Turno aggiunto", "id": row['id'], "date": row['date']}), 201
+        return jsonify({"message":"Turno aggiunto","id":row['id'],"date":row['date']}), 201
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -566,10 +696,10 @@ def update_maintenance(sid):
     try:
         data = request.json
         conn = db(); cur = conn.cursor()
-        cur.execute("UPDATE maintenance_schedule SET status=%s, updated_at=NOW() WHERE id=%s",
+        cur.execute("UPDATE manutenzione SET stato=%s, data_aggiornamento=NOW() WHERE id=%s",
                     (data['status'], sid))
         conn.commit(); cur.close(); conn.close()
-        return jsonify({"message": "Aggiornato"})
+        return jsonify({"message":"Aggiornato"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -577,9 +707,9 @@ def update_maintenance(sid):
 def delete_maintenance(sid):
     try:
         conn = db(); cur = conn.cursor()
-        cur.execute("DELETE FROM maintenance_schedule WHERE id=%s", (sid,))
+        cur.execute("DELETE FROM manutenzione WHERE id=%s", (sid,))
         conn.commit(); cur.close(); conn.close()
-        return jsonify({"message": "Eliminato"})
+        return jsonify({"message":"Eliminato"})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -589,14 +719,14 @@ def get_visit_stats():
     try:
         conn = db(); cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute("""
-            SELECT EXTRACT(HOUR FROM start_time)::INT AS hour, COUNT(*) AS count
-            FROM bookings WHERE status IN ('active','completed')
+            SELECT EXTRACT(HOUR FROM orario_inizio)::INT AS hour, COUNT(*) AS count
+            FROM prenotazione WHERE stato IN ('attiva','completata')
             GROUP BY hour ORDER BY hour
         """)
         hourly = cur.fetchall()
         cur.execute("""
-            SELECT EXTRACT(ISODOW FROM start_time)::INT AS dow, COUNT(*) AS count
-            FROM bookings WHERE status IN ('active','completed')
+            SELECT EXTRACT(ISODOW FROM orario_inizio)::INT AS dow, COUNT(*) AS count
+            FROM prenotazione WHERE stato IN ('attiva','completata')
             GROUP BY dow ORDER BY dow
         """)
         weekly = cur.fetchall(); cur.close(); conn.close()
@@ -604,14 +734,22 @@ def get_visit_stats():
         w_map = {r['dow']:  int(r['count']) for r in weekly}
         days  = ['Lun','Mar','Mer','Gio','Ven','Sab','Dom']
         return jsonify({
-            "hourly":  [{"hour": h, "count": h_map.get(h, 0)} for h in range(24)],
-            "weekly":  [{"day": days[d-1], "dow": d, "count": w_map.get(d, 0)} for d in range(1,8)]
+            "hourly": [{"hour":h,"count":h_map.get(h,0)} for h in range(24)],
+            "weekly": [{"day":days[d-1],"dow":d,"count":w_map.get(d,0)} for d in range(1,8)]
         })
     except Exception:
         return jsonify({
-            "hourly": [{"hour": h, "count": int(max(0, 8*abs(math.sin(h/3.8)) + (12 if 8<=h<=10 else 8 if 14<=h<=16 else 3)))} for h in range(24)],
-            "weekly": [{"day": d, "dow": i+1, "count": v} for i,(d,v) in enumerate(zip(['Lun','Mar','Mer','Gio','Ven','Sab','Dom'],[12,18,25,20,30,45,38]))]
+            "hourly": [{"hour":h,"count":int(max(0,8*abs(math.sin(h/3.8))+(12 if 8<=h<=10 else 8 if 14<=h<=16 else 3)))} for h in range(24)],
+            "weekly": [{"day":d,"dow":i+1,"count":v} for i,(d,v) in enumerate(zip(['Lun','Mar','Mer','Gio','Ven','Sab','Dom'],[12,18,25,20,30,45,38]))]
         })
 
+# ── AVVIO HTTPS / HTTP ─────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    app.run(debug=True, port=5000, host="0.0.0.0")
+    CERT = os.path.join(os.path.dirname(__file__), 'ssl', 'localhost.pem')
+    KEY  = os.path.join(os.path.dirname(__file__), 'ssl', 'localhost-key.pem')
+    if os.path.exists(CERT) and os.path.exists(KEY):
+        print("🔒 HTTPS attivo — https://localhost:5000")
+        app.run(debug=True, host="0.0.0.0", port=5000, ssl_context=(CERT, KEY))
+    else:
+        print("⚠️  Avvio HTTP — http://localhost:5000")
+        app.run(debug=True, host="0.0.0.0", port=5000)
